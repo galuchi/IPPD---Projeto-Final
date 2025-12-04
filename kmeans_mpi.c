@@ -165,77 +165,155 @@ void print_time_and_checksum(Point* centroids, int K, int D, double exec_time) {
 }
 
 int main(int argc, char *argv[]) {
-
-    // Validação e leitura dos argumentos de linha de comando
-    if (argc != 6) {
-        fprintf(stderr, "Uso: %s <arquivo_dados> <M_pontos> <D_dimensoes> <K_clusters> <I_iteracoes>\n", argv[0]);
-        return EXIT_FAILURE;
-    }
-
-    const char* filename = argv[1];  // Nome do arquivo de dados
-    const int M = atoi(argv[2]);     // Número de pontos
-    const int D = atoi(argv[3]);     // Número de dimensões
-    const int K = atoi(argv[4]);     // Número de clusters
-    const int I = atoi(argv[5]);     // Número de iterações
-
-    if (M <= 0 || D <= 0 || K <= 0 || I <= 0 || K > M) {
-        fprintf(stderr, "Erro nos parâmetros. Verifique se M,D,K,I > 0 e K <= M.\n");
-        return EXIT_FAILURE;
-    }
-
-    // --- INÍCIO DO AMBIENTE MPI ---
     int rank, size;
 
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    int M, D, K, I;
+
+    // Ponteiros globais (Rank 0)
+    int* all_coords = NULL;
+    Point* points_global = NULL;
+
+    // 1. LEITURA E PREPARAÇÃO (RANK 0)
     if (rank == 0) {
+        if (argc != 6) MPI_Abort(MPI_COMM_WORLD, 1);
 
-        // --- Alocação de Memória ---
-        int* all_coords = (int*)malloc((M + K) * D * sizeof(int));
-        Point* points = (Point*)malloc(M * sizeof(Point));
-        Point* centroids = (Point*)malloc(K * sizeof(Point));
-        // ... (verificação de alocação) ...
-        for (int i = 0; i < M; i++) {
-            points[i].coords = &all_coords[i * D];
-        }
-        for (int i = 0; i < K; i++) {
-            centroids[i].coords = &all_coords[(M + i) * D];
-        }
+        M = atoi(argv[2]);
+        D = atoi(argv[3]);
+        K = atoi(argv[4]);
+        I = atoi(argv[5]);
 
-        // --- Preparação (Fora da medição de tempo) ---
-        read_data_from_file(filename, points, M, D);
-        initialize_centroids(points, centroids, M, K, D);
-
-        // --- Medição de Tempo do Algoritmo Principal ---
-        struct timespec start, end;
-        clock_gettime(CLOCK_MONOTONIC, &start);  // Inicia o cronômetro
-
-        // Laço principal do K-Means (A única parte que será medida)
-        for (int iter = 0; iter < I; iter++) {
-            assign_points_to_clusters(points, centroids, M, K, D);
-            update_centroids(points, centroids, M, K, D);
+        if (M % size != 0) {
+            fprintf(stderr, "Erro: M deve ser divisível por %d\n", size);
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
 
-        clock_gettime(CLOCK_MONOTONIC, &end);  // Para o cronômetro
+        all_coords = (int*)malloc(M * D * sizeof(int));
+        points_global = (Point*)malloc(M * sizeof(Point));
+        for (int i = 0; i < M; i++) points_global[i].coords = &all_coords[i * D];
 
-        // Calcula o tempo decorrido em segundos
-        double time_taken = (end.tv_sec - start.tv_sec) + 1e-9 * (end.tv_nsec - start.tv_nsec);
-
-        // --- Apresentação dos Resultados ---
-        print_time_and_checksum(centroids, K, D, time_taken);
-
-        // --- Limpeza ---
-        free(all_coords);
-        free(points);
-        free(centroids);
-
+        read_data_from_file(argv[1], points_global, M, D);
     }
 
-    // --- FIM DO AMBIENTE MPI ---
-    // Finaliza o MPI 
-    MPI_Finalize();
+    // 2. BROADCAST DAS DIMENSÕES
+    MPI_Bcast(&M, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&D, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&I, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
+    // 3. ALOCAÇÃO LOCAL E SCATTER
+    int M_local = M / size;
+    int* local_coords = (int*)malloc(M_local * D * sizeof(int));
+    Point* local_points = (Point*)malloc(M_local * sizeof(Point));
+
+    // Configura structs locais
+    for (int i = 0; i < M_local; i++) {
+        local_points[i].coords = &local_coords[i * D];
+        local_points[i].cluster_id = -1;
+    }
+
+    // Distribui os pontos
+    MPI_Scatter(all_coords, M_local * D, MPI_INT, 
+                local_coords, M_local * D, MPI_INT, 
+                0, MPI_COMM_WORLD);
+
+    // 4. PREPARAÇÃO DOS CENTRÓIDES
+    // Vetor linear para armazenar/comunicar centróides (K * D inteiros)
+    int* centroids_coords = (int*)malloc(K * D * sizeof(int));
+    Point* centroids = (Point*)malloc(K * sizeof(Point));
+    for (int k = 0; k < K; k++) centroids[k].coords = &centroids_coords[k * D];
+
+    // Rank 0 inicializa os centróides aleatoriamente na primeira vez
+    if (rank == 0) {
+        initialize_centroids(points_global, centroids, M, K, D);
+    }
+
+    // Buffers para redução (Soma das coordenadas e contagem de pontos por cluster)
+    long long* local_sums = (long long*)malloc(K * D * sizeof(long long));
+    int* local_counts = (int*)malloc(K * sizeof(int));
+
+    long long* global_sums = NULL;
+    int* global_counts = NULL;
+
+    if (rank == 0) {
+        global_sums = (long long*)malloc(K * D * sizeof(long long));
+        global_counts = (int*)malloc(K * sizeof(int));
+    }
+
+    // --- LOOP PRINCIPAL DO K-MEANS ---
+    MPI_Barrier(MPI_COMM_WORLD);
+    double start_time = MPI_Wtime();
+
+    for (int iter = 0; iter < I; iter++) {
+        // A. Rank 0 envia os centróides atuais para todos
+        MPI_Bcast(centroids_coords, K * D, MPI_INT, 0, MPI_COMM_WORLD);
+
+        // B. Zerar acumuladores locais
+        memset(local_sums, 0, K * D * sizeof(long long));
+        memset(local_counts, 0, K * sizeof(int));
+
+        // C. Fase de Atribuição (Paralela)
+        for (int i = 0; i < M_local; i++) {
+            long long min_dist = LLONG_MAX;
+            int best_cluster = -1;
+
+            for (int k = 0; k < K; k++) {
+                long long dist = euclidean_dist_sq(&local_points[i], &centroids[k], D);
+                if (dist < min_dist) {
+                    min_dist = dist;
+                    best_cluster = k;
+                }
+            }
+            local_points[i].cluster_id = best_cluster;
+
+            // Acumula para a fase de atualização
+            local_counts[best_cluster]++;
+            for (int d = 0; d < D; d++) {
+                local_sums[best_cluster * D + d] += local_points[i].coords[d];
+            }
+        }
+
+        // D. Redução (Soma dos parciais no Rank 0)
+        MPI_Reduce(local_sums, global_sums, K * D, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+        MPI_Reduce(local_counts, global_counts, K, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
+
+        // E. Atualização dos Centróides (Apenas Rank 0)
+        if (rank == 0) {
+            for (int k = 0; k < K; k++) {
+                if (global_counts[k] > 0) {
+                    for (int d = 0; d < D; d++) {
+                        centroids[k].coords[d] = global_sums[k * D + d] / global_counts[k];
+                    }
+                }
+            }
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double end_time = MPI_Wtime();
+
+    // --- RESULTADOS FINAIS (RANK 0) ---
+    if (rank == 0) {
+        long long checksum = 0;
+        for (int k = 0; k < K; k++) {
+            for (int d = 0; d < D; d++) {
+                checksum += centroids[k].coords[d];
+            }
+        }
+        print_time_and_checksum(centroids, K, D, end_time - start_time);
+
+        free(all_coords); free(points_global);
+        free(global_sums); free(global_counts);
+    }
+
+    // Limpeza geral
+    free(local_coords); free(local_points);
+    free(centroids_coords); free(centroids);
+    free(local_sums); free(local_counts);
+
+    MPI_Finalize();
     return EXIT_SUCCESS;
 }
