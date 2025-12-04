@@ -242,8 +242,16 @@ int main(int argc, char* argv[]) {
     double time_taken = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
     
     
-    printf("Tempo total: %.5f segundos\n", time_taken);
+    // --- CÁLCULO DO CHECKSUM FINAL E SAÍDA FORMATADA ---
+    long long checksum = 0;
+    for (int i = 0; i < K; i++) {
+        for (int j = 0; j < D; j++) {
+            checksum += centroids[i].coords[j];
+        }
+    }
     
+    printf("%lf\n", time_taken);
+    printf("%lld\n", checksum);
 
     pthread_barrier_destroy(&barrier);
     free(threads);

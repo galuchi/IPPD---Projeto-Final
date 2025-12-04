@@ -198,13 +198,13 @@ int main(int argc, char *argv[]) {
         read_data_from_file(argv[1], points_global, M, D);
     }
 
-    // 2. BROADCAST DAS DIMENSÕES
+    // BROADCAST DAS DIMENSÕES
     MPI_Bcast(&M, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&D, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&K, 1, MPI_INT, 0, MPI_COMM_WORLD);
     MPI_Bcast(&I, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // 3. ALOCAÇÃO LOCAL E SCATTER
+    // ALOCAÇÃO LOCAL E SCATTER
     int M_local = M / size;
     int* local_coords = (int*)malloc(M_local * D * sizeof(int));
     Point* local_points = (Point*)malloc(M_local * sizeof(Point));
@@ -220,7 +220,7 @@ int main(int argc, char *argv[]) {
                 local_coords, M_local * D, MPI_INT, 
                 0, MPI_COMM_WORLD);
 
-    // 4. PREPARAÇÃO DOS CENTRÓIDES
+    // PREPARAÇÃO DOS CENTRÓIDES
     // Vetor linear para armazenar/comunicar centróides (K * D inteiros)
     int* centroids_coords = (int*)malloc(K * D * sizeof(int));
     Point* centroids = (Point*)malloc(K * sizeof(Point));
